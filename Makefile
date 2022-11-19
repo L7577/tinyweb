@@ -1,6 +1,8 @@
 CC = gcc
-CFLAGS = -O2 -Wall -I .
-
+CFLAGC = -O2 -Wall -I .
+ifeq ($(DEBUG),1)
+CFLAGS = -g -DDEBUG -O2 -Wall -I .
+endif
 # This flag includes the Pthreads library on a Linux box.
 # Others systems will probably require something different.
 LIB = -lpthread
