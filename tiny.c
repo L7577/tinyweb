@@ -7,24 +7,24 @@
  *   - Fixed sprintf() aliasing issue in serve_static(), and clienterror().
  *
  * Updated 11/2022
- *   - Add the POST and HEAD method.
- *
- *
+ *   - Support the HTTP POST and HEAD method.
+ *   - Add SIGCCHLD handler reap CGI children.
+ *   - Using malloc,rio_readn,and rio_writen instead of mmap and rio_writen.
+ *   - Using Pthreads.
 */
 
 #include "csapp.h"
 
 void doit(int fd);
-int read_requesthdrs(rio_t *rp,char *method);
+void read_requesthdrs(rio_t *rp, char *method, char *cgiargs);
 int parse_uri(char *uri, char *filename, char *cgiargs, char *method);
 void serve_static(int fd, char *filename, int filesize,char *method);
 void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs,char *method);
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg);
-
 void sigchld_handler(int sig);
-
+void *thread(void *vargp);
 
 int main(int argc, char **argv) 
 {
@@ -32,6 +32,8 @@ int main(int argc, char **argv)
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
+    int *connfdp;
+    pthread_t tid;
 
     /* Check command line args */
     if (argc != 2) {
@@ -39,7 +41,7 @@ int main(int argc, char **argv)
 	    exit(1);
      }
 
-    if (Signal(SIGCHLD, SIG_IGN) == SIG_ERR) { /* Terminated or stopped child */
+     if (Signal(SIGCHLD, SIG_IGN) == SIG_ERR) { /* Terminated or stopped child */
 		unix_error("signal pipe error! \n");
  	}
 
@@ -50,11 +52,25 @@ int main(int argc, char **argv)
         Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, 
                     port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
-    doit(connfd);                                             //line:netp:tiny:doit
-	Close(connfd);                                            //line:netp:tiny:close
-     } 
+     
+    connfdp  = (int*)Malloc(sizeof(int));
+    *connfdp = connfd;
+    Pthread_create(&tid, NULL, thread, connfdp);
+
+    } 
 }
 /* $end tinymain */
+
+/* Thread routine */
+void *thread(void *vargp)
+{
+    int connfd = *((int *)vargp);
+    Pthread_detach(pthread_self());
+    Free(vargp);
+    doit(connfd);
+    Close(connfd);
+    return NULL;
+}
 
 /*
  * doit - handle one HTTP request/response transaction
@@ -75,22 +91,15 @@ void doit(int fd)
     printf("%s", buf);
     sscanf(buf, "%s %s %s", method, uri, version);       //line:netp:doit:parserequest
     if (!(strcasecmp(method, "GET") == 0  || strcasecmp(method, "HEAD") == 0 || 
-		  strcasecmp(method, "POST") == 0))  {                     //line:netp:doit:beginrequesterr
+         strcasecmp(method, "POST") == 0))  {                     //line:netp:doit:beginrequesterr
         clienterror(fd, method, "501", "Not Implemented",
                     "Tiny does not implement this method");
         return;
     }                                                    //line:netp:doit:endrequesterr
-    
-    int par_length = read_requesthdrs(&rio,method);                              //line:netp:doit:readrequesthdrs
-   // printf("length = %d\n",par_length);
-
-    if (strcasecmp(method, "POST") == 0) {         
-      Rio_readnb(&rio, cgiargs, par_length);            /* read cgi args from body */
-      //printf("%s\n",cgiargs);
-	}
-
+    read_requesthdrs(&rio, method, cgiargs);                              //line:netp:doit:readrequesthdrs
+      
     /* Parse URI from HTTP request */
-    is_static = parse_uri(uri, filename, cgiargs,method);       //line:netp:doit:staticcheck
+    is_static = parse_uri(uri, filename, cgiargs, method);       //line:netp:doit:staticcheck
     if (stat(filename, &sbuf) < 0) {                     //line:netp:doit:beginnotfound
 	clienterror(fd, filename, "404", "Not found",
 		    "Tiny couldn't find this file");
@@ -103,7 +112,7 @@ void doit(int fd)
 			"Tiny couldn't read the file");
 	    return;
 	}
-	serve_static(fd, filename, sbuf.st_size,method);        //line:netp:doit:servestatic
+	serve_static(fd, filename, sbuf.st_size, method);        //line:netp:doit:servestatic
     }
     else  { /* Serve dynamic content */
 	if (!( S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) { //line:netp:doit:executable
@@ -111,7 +120,7 @@ void doit(int fd)
 			"Tiny couldn't run the CGI program");
 	    return;
 	}
-	    serve_dynamic(fd, filename, cgiargs,method);            //line:netp:doit:servedynamic
+	    serve_dynamic(fd, filename, cgiargs, method);            //line:netp:doit:servedynamic
 	}
 }
 /* $end doit */
@@ -120,25 +129,22 @@ void doit(int fd)
  * read_requesthdrs - read HTTP request headers
  */
 /* $begin read_requesthdrs */
-int  read_requesthdrs(rio_t *rp,char *method) 
+void  read_requesthdrs(rio_t *rp, char *method, char *cgiargs) 
 {
-    char buf[MAXLINE];
+    char buf[MAXLINE], cgi[MAXLINE];
     int len = -1;
     do {
       Rio_readlineb(rp, buf, MAXLINE);
 	  printf("%s", buf);
 	  
-      if (strcasecmp(method, "POST") == 0 && strncasecmp(buf, "Content-Length:", 15) == 0)
-/*
-    error!!!!!!!!!
-      sscanf(buf,"Content-length: %d",&len);
-      printf("length = %d\n",len);
-*/ 
+      if (strcasecmp(method, "POST") == 0 && strncasecmp(buf, "Content-Length:", 15) == 0) {
 		sscanf(buf,"Content-Length: %d",&len);
-
-      } while(strcmp(buf, "\r\n")) ;          //line:netp:readhdrs:checkterm
-
-    return len;
+        }
+      } while(strcmp (buf, "\r\n")) ;          //line:netp:readhdrs:checkterm
+	  if (strcasecmp(method, "POST") == 0 && len != -1) {
+        Rio_readnb(rp, cgi, len);
+        strcpy(cgiargs, cgi);
+	  }
 }
 /* $end read_requesthdrs */
 
@@ -166,9 +172,10 @@ int parse_uri(char *uri, char *filename, char *cgiargs, char *method)
 		  strcpy(cgiargs, ptr+1);
 		  *ptr = '\0';
 		}
-	else 
-	    strcpy(cgiargs, "");                         //line:netp:parseuri:endextract
-	}
+	    else { 
+	      strcpy(cgiargs, "");                         //line:netp:parseuri:endextract
+        }
+	   }
     strcpy(filename, ".");                           //line:netp:parseuri:beginconvert2
 	strcat(filename, uri);                           //line:netp:parseuri:endconvert2
 	return 0;
@@ -195,9 +202,6 @@ void serve_static(int fd, char *filename, int filesize, char* method)
     Rio_writen(fd, buf, strlen(buf));
     sprintf(buf, "Content-type: %s\r\n\r\n", filetype);
     Rio_writen(fd, buf, strlen(buf));    //line:netp:servestatic:endserve
-   // sprintf(buf, "Connection: Close\r\n");
-   // Rio_writen(fd, buf, strlen(buf));   
-   
 
     /* Send response body to client */
     
@@ -256,18 +260,13 @@ void serve_dynamic(int fd, char *filename, char *cgiargs, char* method)
     sprintf(buf, "Server: Tiny Web Server\r\n");
     Rio_writen(fd, buf, strlen(buf));
     
-    /*HEAD method , doesn`t need to send body to client*/
-    if (strcasecmp(method, "HEAD") == 0)
-        return;  
-    
     if (Fork() == 0) { /* Child */ //line:netp:servedynamic:fork
 	/* Real server would set all CGI vars here */
-	setenv("QUERY_STRING", cgiargs, 1); //line:netp:servedynamic:setenv
-//    setenv("REQUEST_METHOD", method, 1);
+    setenv("QUERY_STRING", cgiargs, 1); //line:netp:servedynamic:setenv
+    setenv("REQUEST_METHOD", method, 1);
 	Dup2(fd, STDOUT_FILENO);         /* Redirect stdout to client */ //line:netp:servedynamic:dup2
 	Execve(filename, emptylist, environ); /* Run CGI program */ //line:netp:servedynamic:execve
     } 
-    //Wait(NULL); /* Parent waits for and reaps child */ //line:netp:servedynamic:wait
 }
 /* $end serve_dynamic */
 
