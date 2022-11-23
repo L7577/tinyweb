@@ -909,7 +909,7 @@ void Rio_writen(int fd, void *usrbuf, size_t n)
 {
     if (rio_writen(fd, usrbuf, n) != n){
         if (errno == EPIPE) {
-           fprintf(stderr,"EPIPE: writen on closed socket\n");
+           //fprintf(stderr,"EPIPE: writen on closed socket\n");
         return;
 		}
 	unix_error("Rio_writen error");

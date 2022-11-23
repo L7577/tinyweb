@@ -11,9 +11,25 @@
  *   - Add SIGCCHLD handler reap CGI children.
  *   - Using malloc,rio_readn,and rio_writen instead of mmap and rio_writen.
  *   - Using Pthreads.
+ *
+ * Update 11/2022
+ *   - Using pre_threads instead of Pthreads.
 */
 
 #include "csapp.h"
+#include "sbuf.h"
+
+
+#ifdef DEBUG
+#define DBG_PRINTF(...) fprintf(stderr,__VA_ARGS__)
+#else
+#define DBG_PRINTF(...)
+#endif    /* DEBUG */
+
+#define SBUFSIZE 4
+#define THREAD_INIT_NUM 1
+#define THREAD_MAX_NUM 1024
+
 
 void doit(int fd);
 void read_requesthdrs(rio_t *rp, char *method, char *cgiargs);
@@ -24,7 +40,19 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,char *method);
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg);
 void sigchld_handler(int sig);
-void *thread(void *vargp);
+void *serve_thread(void *vargp);
+void create_thread(int first, int last);
+void *adjust_thread(void *vargp);
+void init(void);
+
+static sbuf_t sbuf;
+static int numthread;
+
+typedef struct infothread{
+   pthread_t tid;
+   sem_t mutex;
+}infotd;
+static infotd thread[THREAD_MAX_NUM];
 
 int main(int argc, char **argv) 
 {
@@ -32,45 +60,99 @@ int main(int argc, char **argv)
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
-    int *connfdp;
     pthread_t tid;
 
     /* Check command line args */
     if (argc != 2) {
      	fprintf(stderr, "usage: %s <port>\n", argv[0]);
 	    exit(1);
-     }
-
-     if (Signal(SIGCHLD, SIG_IGN) == SIG_ERR) { /* Terminated or stopped child */
+     } 
+    if (Signal(SIGCHLD, sigchld_handler) == SIG_ERR){
+         unix_error("sigchld handler error\n");
+    }
+    if (Signal(SIGPIPE, SIG_IGN) == SIG_ERR) { /* Terminated or stopped child */
 		unix_error("signal pipe error! \n");
  	}
 
     listenfd = Open_listenfd(argv[1]);
-    while (1) {
-	clientlen = sizeof(clientaddr);
-	connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); //line:netp:tiny:accept
+    
+    numthread = THREAD_INIT_NUM;
+    sbuf_init(&sbuf, SBUFSIZE);    
+    create_thread(0, numthread);
+    Pthread_create(&tid, NULL, adjust_thread, NULL); 
+    while (1) { 
+    	clientlen = sizeof(struct sockaddr_storage);
+	    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); //line:netp:tiny:accept
         Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, 
                     port, MAXLINE, 0);
-        printf("Accepted connection from (%s, %s)\n", hostname, port);
-     
-    connfdp  = (int*)Malloc(sizeof(int));
-    *connfdp = connfd;
-    Pthread_create(&tid, NULL, thread, connfdp);
-
-    } 
+        //printf("Accepted connection from (%s, %s)\n", hostname, port);
+        sbuf_insert(&sbuf, connfd);
+    }
+    return 0;
 }
 /* $end tinymain */
 
+/* begin create_thread */
+void create_thread(int first, int last )
+{ 
+  int i;
+   for (i = first; i < last; i++) {
+     Sem_init(&(thread[i].mutex), 0, 1);
+     
+     int *fd = (int*)Malloc(sizeof(int));
+     *fd = i;
+     Pthread_create(&(thread[i].tid), NULL, serve_thread, fd);
+     DBG_PRINTF("create thread[%d]\n",i);
+  } 
+} 
+/*end create_thread */
+
+void *adjust_thread(void *vargp) 
+{ 
+  sbuf_t *sp = &sbuf;
+
+  while (1) {
+     if (sbuf_full(sp)) {
+        if (numthread == THREAD_MAX_NUM) {
+			fprintf(stderr, "too many threads , can`t adjust.\n");
+        continue;
+		}
+     int double_numtd = 2 * numthread;
+     create_thread(numthread, double_numtd);
+     DBG_PRINTF("add double thread!\n");
+     numthread = double_numtd;
+     continue;
+     }
+     if (sbuf_empty(sp)) {
+       if (numthread == 1)
+         continue;
+       int half_numtd = numthread / 2;
+       int i;
+       for (i = half_numtd; i < numthread; i++) {
+         DBG_PRINTF("cancel thread[%d]\n",i);
+         P(&(thread[i].mutex));
+         Pthread_cancel(thread[i].tid);
+         V(&(thread[i].mutex));
+       }
+       numthread = half_numtd;
+       continue;
+     }
+  }
+}  
 /* Thread routine */
-void *thread(void *vargp)
+void *serve_thread(void *vargp)
 {
-    int connfd = *((int *)vargp);
+    int fd = *(int*)vargp;
     Pthread_detach(pthread_self());
     Free(vargp);
+    while (1) {
+    P(&(thread[fd].mutex));
+    int connfd = sbuf_remove(&sbuf);
     doit(connfd);
     Close(connfd);
-    return NULL;
-}
+    V(&(thread[fd].mutex));
+    }
+} 
 
 /*
  * doit - handle one HTTP request/response transaction
@@ -88,7 +170,7 @@ void doit(int fd)
     Rio_readinitb(&rio, fd);
     if (!Rio_readlineb(&rio, buf, MAXLINE))  //line:netp:doit:readrequest
         return;
-    printf("%s", buf);
+    //printf("%s", buf);
     sscanf(buf, "%s %s %s", method, uri, version);       //line:netp:doit:parserequest
     if (!(strcasecmp(method, "GET") == 0  || strcasecmp(method, "HEAD") == 0 || 
          strcasecmp(method, "POST") == 0))  {                     //line:netp:doit:beginrequesterr
@@ -135,7 +217,7 @@ void  read_requesthdrs(rio_t *rp, char *method, char *cgiargs)
     int len = -1;
     do {
       Rio_readlineb(rp, buf, MAXLINE);
-	  printf("%s", buf);
+	  //printf("%s", buf);
 	  
       if (strcasecmp(method, "POST") == 0 && strncasecmp(buf, "Content-Length:", 15) == 0) {
 		sscanf(buf,"Content-Length: %d",&len);
@@ -261,6 +343,10 @@ void serve_dynamic(int fd, char *filename, char *cgiargs, char* method)
     Rio_writen(fd, buf, strlen(buf));
     
     if (Fork() == 0) { /* Child */ //line:netp:servedynamic:fork
+      if (Signal(SIGPIPE, SIG_DFL) == SIG_ERR) { /* Terminated or stopped child */
+        unix_error("signal pipe error! \n");
+      }
+    
 	/* Real server would set all CGI vars here */
     setenv("QUERY_STRING", cgiargs, 1); //line:netp:servedynamic:setenv
     setenv("REQUEST_METHOD", method, 1);
@@ -307,9 +393,9 @@ void clienterror(int fd, char *cause, char *errnum,
 void sigchld_handler(int sig)
 {
     int olderrno = errno;
-    int status;
+    int status;    
     pid_t pid;
-	while ((pid = waitpid(-1,&status,WNOHANG | WUNTRACED)) > 0) {
+	while ((pid = waitpid(-1,&status,WNOHANG)) > 0) {
        printf("recycle child process! \n");
     }
 	
